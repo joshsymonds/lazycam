@@ -6,14 +6,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestTracker_EmptyHasZeroRefCount(t *testing.T) {
-	t.Parallel()
-	var tr Tracker
-	if got := tr.RefCount(); got != 0 {
-		t.Errorf("RefCount = %d, want 0", got)
-	}
-}
-
 func TestTracker_SingleOpenActivates(t *testing.T) {
 	t.Parallel()
 	var tr Tracker

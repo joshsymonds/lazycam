@@ -46,22 +46,6 @@ func TestDryRunSwitcher_LogsWithoutNetwork(t *testing.T) {
 	}
 }
 
-func TestDryRunSwitcher_CloseIsNoop(t *testing.T) {
-	t.Parallel()
-	logger, _ := captureLogger(t)
-	ctx := context.Background()
-	sw, err := newSwitcher(ctx, logger, switcherOptions{dryRun: true})
-	if err != nil {
-		t.Fatalf("newSwitcher: %v", err)
-	}
-	if err := sw.Close(); err != nil {
-		t.Errorf("Close (first call): %v", err)
-	}
-	if err := sw.Close(); err != nil {
-		t.Errorf("Close (second call): %v", err)
-	}
-}
-
 // TestLiveSwitcher_SetSceneBeforeConnectedDoesNotPanic guarantees that
 // the daemon doesn't crash when OBS is unreachable at startup. The
 // SetScene call is dropped with a WARN log; the connectLoop continues

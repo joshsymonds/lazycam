@@ -1,0 +1,161 @@
+# lazycam home-manager module.
+#
+# Wires the lazycam daemon as a systemd --user service tied to
+# graphical-session.target — meaning it starts when the user logs into
+# their graphical session and shuts down cleanly on logout.
+#
+# Consumer pattern (in nix-config):
+#
+#   {
+#     imports = [ inputs.lazycam.homeManagerModules.default ];
+#     services.lazycam = {
+#       enable = true;
+#       package = inputs.lazycam.packages.${pkgs.system}.default;
+#       device = "/dev/video10";
+#       obsUrl = "ws://127.0.0.1:4455";
+#     };
+#   }
+#
+# Either pass `package = ...` explicitly OR add lazycam to your nixpkgs
+# overlay so `pkgs.lazycam` resolves. The module's default reaches for
+# `pkgs.lazycam` and throws a helpful error if not present, since a
+# home-manager module can't reach flake inputs without specialArgs.
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}: let
+  cfg = config.services.lazycam;
+
+  # Compose the ExecStart command from the typed options. lib.escapeShellArg
+  # quotes each value so paths with spaces / shell metacharacters survive
+  # the systemd-unit -> shell parse.
+  execArgs = lib.concatStringsSep " " (lib.filter (s: s != "") [
+    "--device=${lib.escapeShellArg cfg.device}"
+    "--obs-url=${lib.escapeShellArg cfg.obsUrl}"
+    "--scene-active=${lib.escapeShellArg cfg.sceneActive}"
+    "--scene-standby=${lib.escapeShellArg cfg.sceneStandby}"
+    (lib.optionalString (cfg.stateSocket != null)
+      "--state-socket=${lib.escapeShellArg cfg.stateSocket}")
+    (lib.optionalString cfg.dryRun "--dry-run")
+    (lib.optionalString cfg.debug "--debug")
+  ]);
+in {
+  options.services.lazycam = {
+    enable = lib.mkEnableOption "lazycam, on-demand v4l2 producer gating for OBS";
+
+    package = lib.mkOption {
+      type = lib.types.package;
+      default =
+        pkgs.lazycam or (throw ''
+          services.lazycam: `pkgs.lazycam` is not in scope.
+
+          Either:
+            1. Pass the package explicitly:
+                 services.lazycam.package = inputs.lazycam.packages.\${pkgs.system}.default;
+            2. Add lazycam to your nixpkgs overlay so `pkgs.lazycam` resolves.
+
+          A home-manager module cannot reach flake inputs without
+          specialArgs, so we cannot do this for you here.
+        '');
+      defaultText = lib.literalExpression "pkgs.lazycam";
+      description = "The lazycam package to run.";
+    };
+
+    device = lib.mkOption {
+      type = lib.types.str;
+      default = "/dev/video10";
+      example = "/dev/video10";
+      description = "v4l2 device path the daemon watches for opens/closes.";
+    };
+
+    obsUrl = lib.mkOption {
+      type = lib.types.str;
+      default = "ws://127.0.0.1:4455";
+      example = "ws://127.0.0.1:4455";
+      description = ''
+        OBS WebSocket v5 endpoint, in either `ws://host:port` or bare
+        `host:port` form. Loopback only; lazycam disables OBS WebSocket
+        auth by design (UNIX socket on /run/user is the access boundary).
+      '';
+    };
+
+    sceneActive = lib.mkOption {
+      type = lib.types.str;
+      default = "Active";
+      example = "Active";
+      description = ''
+        OBS scene name lazycam switches to when the first consumer
+        attaches to the v4l2 loopback device. Must exist in the user's
+        scene collection.
+      '';
+    };
+
+    sceneStandby = lib.mkOption {
+      type = lib.types.str;
+      default = "Standby";
+      example = "Standby";
+      description = ''
+        OBS scene name lazycam switches to when the last consumer
+        releases the v4l2 loopback device. Should NOT include any
+        video-capture-device source so OBS releases the real /dev/video0
+        handle and the hardware LED goes off.
+      '';
+    };
+
+    stateSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/run/user/1000/lazycam.sock";
+      description = ''
+        Optional UNIX socket path where lazycam publishes newline-
+        delimited JSON state events for external indicators. When null,
+        the daemon defaults to $XDG_RUNTIME_DIR/lazycam.sock at runtime.
+      '';
+    };
+
+    dryRun = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = false;
+      description = ''
+        Log intended scene transitions instead of contacting OBS.
+        Useful for testing the state pipeline without a live OBS.
+      '';
+    };
+
+    debug = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = false;
+      description = ''
+        Log every inotify event (otherwise only 0↔N transitions are
+        logged). Verbose; intended for troubleshooting.
+      '';
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    systemd.user.services.lazycam = {
+      Unit = {
+        Description = "lazycam — on-demand v4l2 producer gating for OBS virtual-cam privacy";
+        Documentation = ["https://github.com/joshsymonds/lazycam"];
+        PartOf = ["graphical-session.target"];
+        After = ["graphical-session.target"];
+      };
+      Service = {
+        ExecStart = "${lib.getExe cfg.package} ${execArgs}";
+        Restart = "on-failure";
+        RestartSec = 2;
+        # The daemon needs read access to the v4l2 device; on most
+        # distros /dev/video* is group=video and the user is already in
+        # that group. No extra capabilities needed for inotify or the
+        # UNIX socket.
+      };
+      Install = {
+        WantedBy = ["graphical-session.target"];
+      };
+    };
+  };
+}

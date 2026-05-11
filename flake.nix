@@ -23,7 +23,16 @@
     devenv,
     ...
   } @ inputs:
-    flake-utils.lib.eachDefaultSystem (system: let
+  # System-agnostic outputs (modules, overlays) live outside
+  # eachDefaultSystem; per-system outputs (packages, apps, devShells)
+  # live inside.
+    {
+      homeManagerModules = {
+        default = import ./nix/home-manager-module.nix;
+        lazycam = import ./nix/home-manager-module.nix;
+      };
+    }
+    // flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
       lazycam-package = pkgs.callPackage ./package.nix {};
     in {

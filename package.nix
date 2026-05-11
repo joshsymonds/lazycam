@@ -11,6 +11,6 @@ buildGo126Module {
   # vendorHash auto-discovered by `just vendor-hash` (or `nix build`,
   # which prints the "got: sha256-..." line on mismatch). Update when
   # go.mod/go.sum changes.
-  vendorHash = "sha256-86S0gZ4p4VTZhqwWq0XaCjCBqvsEbdXMIBxsxA86woQ=";
+  vendorHash = "sha256-Uy5Oe4ogEde/bqimb5B72ORC+Zm0hcc+qXwqVPIE4FA=";
   meta.mainProgram = "lazycam";
 }

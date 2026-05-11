@@ -56,9 +56,9 @@ func main() {
 	flag.StringVar(&cfg.sceneStandby, "scene-standby", "Standby",
 		"OBS scene name to switch to when the last consumer releases")
 	flag.StringVar(&cfg.obsURL, "obs-url", "ws://127.0.0.1:4455",
-		"OBS WebSocket v5 endpoint (consumed by live mode, task #5)")
-	flag.BoolVar(&cfg.dryRun, "dry-run", true,
-		"log intended scene transitions instead of contacting OBS (default true until task #5 lands live mode)")
+		"OBS WebSocket v5 endpoint (ws://host:port or bare host:port)")
+	flag.BoolVar(&cfg.dryRun, "dry-run", false,
+		"log intended scene transitions instead of contacting OBS")
 	flag.BoolVar(&cfg.debug, "debug", false,
 		"log every inotify event (otherwise only 0↔N transitions are logged)")
 	flag.Parse()
@@ -82,7 +82,14 @@ func run(logger *slog.Logger, cfg config) error {
 		return fmt.Errorf("device %q not accessible: %w", cfg.device, err)
 	}
 
-	switcher, err := newSwitcher(logger, switcherOptions{
+	// Signal-handler context — drives switcher lifecycle, inotify
+	// shutdown, and the main select loop's exit. Built early so the
+	// switcher's connect/reconnect loop can be tied to it.
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	switcher, err := newSwitcher(ctx, logger, switcherOptions{
 		dryRun:       cfg.dryRun,
 		obsURL:       cfg.obsURL,
 		sceneActive:  cfg.sceneActive,
@@ -122,10 +129,6 @@ func run(logger *slog.Logger, cfg config) error {
 	}()
 
 	logger.Info("watching", "device", cfg.device)
-
-	ctx, stop := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// inotify reads block; do them on a goroutine and surface results on
 	// channels so the main loop can select on ctx for shutdown.

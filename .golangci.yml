@@ -249,6 +249,7 @@ linters:
         - mu
         - n
         - d # idiomatic local for *daemon (receiver name also `d`)
+        - s # idiomatic local for *liveSwitcher (receiver name also `s`)
       ignore-decls:
         - i int
         - j int

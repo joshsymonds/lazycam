@@ -3,10 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // captureLogger returns a *slog.Logger that writes JSON lines into the
@@ -23,7 +23,8 @@ func captureLogger(t *testing.T) (*slog.Logger, *bytes.Buffer) {
 func TestDryRunSwitcher_LogsWithoutNetwork(t *testing.T) {
 	t.Parallel()
 	logger, buf := captureLogger(t)
-	sw, err := newSwitcher(logger, switcherOptions{dryRun: true})
+	ctx := context.Background()
+	sw, err := newSwitcher(ctx, logger, switcherOptions{dryRun: true})
 	if err != nil {
 		t.Fatalf("newSwitcher: %v", err)
 	}
@@ -33,7 +34,7 @@ func TestDryRunSwitcher_LogsWithoutNetwork(t *testing.T) {
 		}
 	})
 
-	if err := sw.SetScene(context.Background(), "Active"); err != nil {
+	if err := sw.SetScene(ctx, "Active"); err != nil {
 		t.Fatalf("SetScene: %v", err)
 	}
 	out := buf.String()
@@ -48,7 +49,8 @@ func TestDryRunSwitcher_LogsWithoutNetwork(t *testing.T) {
 func TestDryRunSwitcher_CloseIsNoop(t *testing.T) {
 	t.Parallel()
 	logger, _ := captureLogger(t)
-	sw, err := newSwitcher(logger, switcherOptions{dryRun: true})
+	ctx := context.Background()
+	sw, err := newSwitcher(ctx, logger, switcherOptions{dryRun: true})
 	if err != nil {
 		t.Fatalf("newSwitcher: %v", err)
 	}
@@ -60,18 +62,71 @@ func TestDryRunSwitcher_CloseIsNoop(t *testing.T) {
 	}
 }
 
-// TestNewSwitcher_LiveModeNotYetImplemented locks the contract for the
-// pre-task-#5 state: requesting live mode (dryRun=false) returns the
-// sentinel `errLiveNotImplemented`. DELETE this test in task #5 when
-// the live switcher actually exists.
-func TestNewSwitcher_LiveModeNotYetImplemented(t *testing.T) {
+// TestLiveSwitcher_SetSceneBeforeConnectedDoesNotPanic guarantees that
+// the daemon doesn't crash when OBS is unreachable at startup. The
+// SetScene call is dropped with a WARN log; the connectLoop continues
+// retrying in the background. This is the daemon's "OBS is down,
+// don't take me down with it" invariant.
+func TestLiveSwitcher_SetSceneBeforeConnectedDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	logger, _ := captureLogger(t)
-	_, err := newSwitcher(logger, switcherOptions{dryRun: false})
-	if err == nil {
-		t.Fatal("expected error for live mode, got nil")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Port 1 is the TCPMUX well-known port — nothing listens by default,
+	// and connection failure is fast (ECONNREFUSED rather than timeout).
+	sw, err := newSwitcher(ctx, logger, switcherOptions{
+		dryRun: false,
+		obsURL: "ws://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("newSwitcher: %v", err)
 	}
-	if !errors.Is(err, errLiveNotImplemented) {
-		t.Errorf("expected errLiveNotImplemented, got: %v", err)
+	t.Cleanup(func() {
+		if cerr := sw.Close(); cerr != nil {
+			t.Errorf("Close: %v", cerr)
+		}
+	})
+
+	// SetScene must return without panicking; nil err means call was
+	// gracefully dropped, non-nil means a hard failure surfaced.
+	done := make(chan error, 1)
+	go func() { done <- sw.SetScene(ctx, "Active") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("SetScene before connected: got err %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SetScene before connected: did not return within 1s")
+	}
+}
+
+// TestLiveSwitcher_CloseBeforeConnect locks the invariant that Close
+// is safe to call before the first connection attempt has succeeded.
+// Without this, a daemon SIGTERM during OBS startup could hang.
+func TestLiveSwitcher_CloseBeforeConnect(t *testing.T) {
+	t.Parallel()
+	logger, _ := captureLogger(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sw, err := newSwitcher(ctx, logger, switcherOptions{
+		dryRun: false,
+		obsURL: "ws://127.0.0.1:1",
+	})
+	if err != nil {
+		t.Fatalf("newSwitcher: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- sw.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close: did not return within 2s")
 	}
 }

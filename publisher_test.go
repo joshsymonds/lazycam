@@ -142,22 +142,107 @@ func TestUnixSocketPublisher_DropsDeadSubscribers(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = pub.Close() })
 
-	// Connect, then close from the client side without reading.
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	// Give the publisher a moment to register us + write the snapshot
-	// (which will succeed; the kernel buffer absorbs it). Then close.
-	time.Sleep(50 * time.Millisecond)
-	_ = conn.Close()
+	// Wait until the publisher has registered us. Polling
+	// subscriberCount avoids racing on a fixed sleep.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && pub.subscriberCount() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := pub.subscriberCount(); got != 1 {
+		t.Fatalf("subscriberCount after dial = %d, want 1", got)
+	}
 
-	// Now Publish multiple events. None should hang or return errors;
-	// the publisher should detect the broken pipe and drop us.
+	// Close from the client side. The publisher's watchConn goroutine
+	// should observe the EOF and drop us; we then verify by polling.
+	_ = conn.Close()
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && pub.subscriberCount() != 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := pub.subscriberCount(); got != 0 {
+		t.Errorf("subscriberCount after client close = %d, want 0", got)
+	}
+
+	// Subsequent Publishes must not hang or error even though our
+	// subscriber is gone.
 	for i := range 3 {
 		if err := pub.Publish(StateActive, i, time.Now()); err != nil {
 			t.Errorf("Publish[%d] after subscriber death: %v", i, err)
 		}
+	}
+}
+
+// TestUnixSocketPublisher_OrderingMonotonic locks the ordering
+// invariant: a subscriber's reads are monotonic in publish timestamp.
+// Without the snapshot-write-under-lock fix, a Publish racing with
+// registerSubscriber could deliver its event to the new conn before
+// the snapshot landed — and the subscriber would observe state in
+// reverse-chronological order, which is the bug the indicator widget
+// would manifest as a stuck stale display.
+//
+// We assert the weaker but provable invariant: across many concurrent
+// dial+publish races, no subscriber ever observes a line whose
+// timestamp predates a line it read earlier on the same connection.
+func TestUnixSocketPublisher_OrderingMonotonic(t *testing.T) {
+	t.Parallel()
+	logger, _ := captureLogger(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	path := testSocketPath(t)
+	pub, err := newPublisher(ctx, logger, path)
+	if err != nil {
+		t.Fatalf("newPublisher: %v", err)
+	}
+	t.Cleanup(func() { _ = pub.Close() })
+
+	const trials = 30
+	for trial := range trials {
+		conn, derr := net.Dial("unix", path)
+		if derr != nil {
+			t.Fatalf("trial %d: dial: %v", trial, derr)
+		}
+
+		// Race a Publish against the dial+register sequence. The
+		// publish's timestamp is necessarily later than the snapshot's
+		// (the snapshot's was set by the prior trial's last publish,
+		// or by newPublisher's lastState init).
+		broadcastDone := make(chan struct{})
+		go func() {
+			_ = pub.Publish(StateActive, trial, time.Now())
+			close(broadcastDone)
+		}()
+
+		if rerr := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); rerr != nil {
+			t.Fatalf("trial %d: SetReadDeadline: %v", trial, rerr)
+		}
+		reader := bufio.NewReader(conn)
+
+		// Read 1-2 lines. The first is the snapshot; the second (if
+		// present) is either the racing broadcast (registerSubscriber
+		// won) or a subsequent publish. We require: ts[i+1] >= ts[i].
+		var prevTS time.Time
+		for i := range 2 {
+			line, rerr := reader.ReadBytes('\n')
+			if rerr != nil {
+				break // Second line may legitimately time out.
+			}
+			var ev publishedEvent
+			if uerr := json.Unmarshal(line, &ev); uerr != nil {
+				t.Fatalf("trial %d line %d: unmarshal: %v", trial, i, uerr)
+			}
+			if i > 0 && ev.Timestamp.Before(prevTS) {
+				t.Errorf("trial %d: line %d timestamp %v precedes previous %v — reverse ordering",
+					trial, i, ev.Timestamp, prevTS)
+			}
+			prevTS = ev.Timestamp
+		}
+		<-broadcastDone
+		_ = conn.Close()
 	}
 }
 

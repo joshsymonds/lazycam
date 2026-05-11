@@ -107,6 +107,10 @@ func TestTransition_StringReadable(t *testing.T) {
 		TransitionNone:       "none",
 		TransitionActivate:   "activate",
 		TransitionDeactivate: "deactivate",
+		// Unknown enum values fall through to the default branch.
+		// Using a numerically-out-of-range Transition exercises the
+		// fallthrough that an exhaustive-switch refactor could miss.
+		Transition(99): "unknown",
 	}
 	for tr, want := range cases {
 		if got := tr.String(); got != want {

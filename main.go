@@ -105,10 +105,8 @@ func run(logger *slog.Logger, cfg config) error {
 	defer stop()
 
 	switcher, err := newSwitcher(ctx, logger, switcherOptions{
-		dryRun:       cfg.dryRun,
-		obsURL:       cfg.obsURL,
-		sceneActive:  cfg.sceneActive,
-		sceneStandby: cfg.sceneStandby,
+		dryRun: cfg.dryRun,
+		obsURL: cfg.obsURL,
 	})
 	if err != nil {
 		return fmt.Errorf("switcher: %w", err)
@@ -159,7 +157,7 @@ func run(logger *slog.Logger, cfg config) error {
 	// channels so the main loop can select on ctx for shutdown.
 	events := make(chan unix.InotifyEvent, 16)
 	readErr := make(chan error, 1)
-	go readLoop(fd, events, readErr)
+	go readLoop(ctx, fd, events, readErr)
 
 	d := &daemon{
 		logger:       logger,
@@ -223,14 +221,27 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 // readLoop pulls inotify event records off fd. Each read may yield zero
 // or more InotifyEvent structs back-to-back; we walk the buffer using
 // the documented header size + Len trailer.
-func readLoop(fd int, events chan<- unix.InotifyEvent, errCh chan<- error) {
+//
+// Shutdown: `unix.Read` is uninterruptible-by-cancel, so we rely on the
+// caller closing fd to make Read return EBADF and unwedge the loop.
+// We additionally check ctx.Err() each iteration so that — if a future
+// caller forgets to close the fd promptly — we still notice cancellation
+// and exit cleanly rather than spin on the closed-but-still-readable fd.
+func readLoop(ctx context.Context, fd int, events chan<- unix.InotifyEvent, errCh chan<- error) {
 	defer close(events)
 	buf := make([]byte, 4096)
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		n, err := unix.Read(fd, buf)
 		if err != nil {
 			if errors.Is(err, unix.EINTR) {
 				continue
+			}
+			if ctx.Err() != nil {
+				// Expected: caller closed the fd as part of shutdown.
+				return
 			}
 			errCh <- err
 			return

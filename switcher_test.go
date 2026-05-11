@@ -102,6 +102,71 @@ func TestLiveSwitcher_SetSceneBeforeConnectedDoesNotPanic(t *testing.T) {
 	}
 }
 
+func TestExtractHost(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "ws scheme", input: "ws://127.0.0.1:4455", want: "127.0.0.1:4455"},
+		{name: "wss scheme", input: "wss://127.0.0.1:4455", want: "127.0.0.1:4455"},
+		{name: "bare host port", input: "127.0.0.1:4455", want: "127.0.0.1:4455"},
+		{name: "localhost", input: "ws://localhost:4455", want: "localhost:4455"},
+		{name: "empty", input: "", wantErr: true},
+		{name: "no port", input: "ws://obs", wantErr: true},
+		{name: "no port bare", input: "obs", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := extractHost(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("extractHost(%q) = %q, want error", tc.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("extractHost(%q) returned error: %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Errorf("extractHost(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRequireLoopback(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		hostPort string
+		wantErr  bool
+	}{
+		{name: "v4 loopback", hostPort: "127.0.0.1:4455", wantErr: false},
+		{name: "v4 loopback other octet", hostPort: "127.0.0.42:4455", wantErr: false},
+		{name: "v6 loopback", hostPort: "[::1]:4455", wantErr: false},
+		{name: "localhost", hostPort: "localhost:4455", wantErr: false},
+		{name: "public v4", hostPort: "8.8.8.8:4455", wantErr: true},
+		{name: "private v4", hostPort: "192.168.1.1:4455", wantErr: true},
+		{name: "hostname non-localhost", hostPort: "obs.example.com:4455", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := requireLoopback(tc.hostPort)
+			if tc.wantErr && err == nil {
+				t.Errorf("requireLoopback(%q): want error, got nil", tc.hostPort)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("requireLoopback(%q): %v", tc.hostPort, err)
+			}
+		})
+	}
+}
+
 // TestLiveSwitcher_CloseBeforeConnect locks the invariant that Close
 // is safe to call before the first connection attempt has succeeded.
 // Without this, a daemon SIGTERM during OBS startup could hang.

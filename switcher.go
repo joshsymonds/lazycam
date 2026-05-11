@@ -4,12 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/andreykaipov/goobs"
 	"github.com/andreykaipov/goobs/api/requests/scenes"
+	"github.com/gorilla/websocket"
 )
 
 // Switcher is the abstraction the daemon's event loop calls on
@@ -23,12 +26,12 @@ type Switcher interface {
 
 // switcherOptions carries everything the constructor needs across
 // modes. dryRun gates the implementation; obsURL is consumed by the
-// live switcher only.
+// live switcher only. Scene names are owned by the daemon (not the
+// Switcher) since each transition picks one — the switcher's API is
+// stateless `SetScene(ctx, name)`.
 type switcherOptions struct {
-	dryRun       bool
-	obsURL       string
-	sceneActive  string
-	sceneStandby string
+	dryRun bool
+	obsURL string
 }
 
 // newSwitcher returns the appropriate Switcher for the requested mode.
@@ -88,18 +91,29 @@ type liveSwitcher struct {
 }
 
 const (
-	initialBackoff     = time.Second
-	maxBackoff         = 30 * time.Second
-	setSceneRPCTimeout = 5 * time.Second
-	backoffMultiplier  = 2
+	initialBackoff    = time.Second
+	maxBackoff        = 30 * time.Second
+	backoffMultiplier = 2
+
+	// handshakeTimeout bounds the worst-case time goobs.New can block.
+	// gorilla/websocket's default is 45s, which combined with goobs's
+	// 10s response timeout would let SIGTERM stall Close() up to ~55s
+	// while a dial is in flight. Capping both at 5s keeps shutdown
+	// snappy without sacrificing realistic LAN/loopback connect time.
+	handshakeTimeout = 5 * time.Second
+	rpcTimeout       = 5 * time.Second
 )
 
 // newLiveSwitcher kicks off the background connect loop and returns.
-// Returns an error only for invalid configuration (e.g. unparseable URL).
+// Returns an error only for invalid configuration (e.g. unparseable
+// URL, non-loopback host).
 func newLiveSwitcher(parentCtx context.Context, logger *slog.Logger, opts switcherOptions) (*liveSwitcher, error) {
 	host, err := extractHost(opts.obsURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse obs-url: %w", err)
+	}
+	if lerr := requireLoopback(host); lerr != nil {
+		return nil, fmt.Errorf("obs-url is not loopback: %w", lerr)
 	}
 	ctx, cancel := context.WithCancel(parentCtx)
 	s := &liveSwitcher{
@@ -114,18 +128,67 @@ func newLiveSwitcher(parentCtx context.Context, logger *slog.Logger, opts switch
 }
 
 // extractHost strips the ws:// (or wss://) scheme from a configured
-// URL, returning host:port for goobs.New (which prepends ws:// itself).
-// Bare host:port input is accepted unchanged.
+// URL and returns host:port for goobs.New (which prepends ws:// itself).
+// Bare host:port input is accepted unchanged. Returns an error for an
+// empty input or for a host without an explicit port — both would
+// otherwise drive connectLoop into an infinite retry against an
+// unreachable target with no operator-visible cause.
+//
+// The bare-host:port path bypasses url.Parse: Go's url package rejects
+// inputs like "127.0.0.1:4455" because it treats "127.0.0.1" as a
+// scheme. We detect scheme presence via "://" and fall back to a plain
+// `:`-contains check when none is present.
 func extractHost(rawURL string) (string, error) {
-	parsed, err := url.Parse(rawURL)
+	if rawURL == "" {
+		return "", fmt.Errorf("obs-url is empty")
+	}
+	var host string
+	if strings.Contains(rawURL, "://") {
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			return "", fmt.Errorf("url.Parse %q: %w", rawURL, err)
+		}
+		host = parsed.Host
+	} else {
+		// No scheme — treat the whole thing as host:port.
+		host = rawURL
+	}
+	if host == "" {
+		return "", fmt.Errorf("obs-url %q yielded empty host", rawURL)
+	}
+	if !strings.Contains(host, ":") {
+		return "", fmt.Errorf("obs-url %q missing port; expected host:port", rawURL)
+	}
+	return host, nil
+}
+
+// localhostName is the only hostname (non-IP) we accept for loopback
+// validation. Pulled out as a constant to satisfy goconst.
+const localhostName = "localhost"
+
+// requireLoopback rejects an obs-url that points anywhere other than
+// 127.0.0.0/8, ::1, or localhost. lazycam disables OBS WebSocket auth
+// by design (the loopback-only invariant IS the auth boundary), so
+// pointing at a remote OBS would be a privilege escalation footgun.
+// The module documentation in nix/home-manager-module.nix explicitly
+// promises "loopback only"; this validator enforces it.
+func requireLoopback(hostPort string) error {
+	host, _, err := net.SplitHostPort(hostPort)
 	if err != nil {
-		return "", fmt.Errorf("url.Parse %q: %w", rawURL, err)
+		return fmt.Errorf("split host:port %q: %w", hostPort, err)
 	}
-	if parsed.Host != "" {
-		return parsed.Host, nil
+	if host == localhostName {
+		return nil
 	}
-	// No scheme — treat the whole thing as host:port.
-	return rawURL, nil
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("obs-url host %q is not an IP literal or %s; "+
+			"refuse to dial off-loopback", host, localhostName)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("obs-url host %q is not a loopback address", host)
+	}
+	return nil
 }
 
 // SetScene asks OBS to switch to the named scene. If the connection
@@ -142,11 +205,6 @@ func (s *liveSwitcher) SetScene(ctx context.Context, name string) error {
 		s.logger.WarnContext(ctx, "obs not connected; dropping scene switch", "scene", name)
 		return nil
 	}
-
-	// Bound the RPC; OBS WebSocket has been known to hang on bad state.
-	callCtx, cancel := context.WithTimeout(ctx, setSceneRPCTimeout)
-	defer cancel()
-	_ = callCtx // goobs's API is synchronous and doesn't take ctx; the timeout is for future use.
 
 	_, err := client.Scenes.SetCurrentProgramScene(
 		scenes.NewSetCurrentProgramSceneParams().WithSceneName(name),
@@ -178,9 +236,18 @@ func (s *liveSwitcher) connectLoop(ctx context.Context) {
 	defer close(s.done)
 	defer s.disconnectActive()
 
+	// Bound goobs.New's blocking time so SIGTERM doesn't stall Close()
+	// waiting on the ~45s gorilla/websocket handshake default. The dialer
+	// is shared across reconnect iterations; goobs reads it once per
+	// New() call.
+	dialer := &websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+
 	backoff := initialBackoff
 	for ctx.Err() == nil {
-		client, err := goobs.New(s.host)
+		client, err := goobs.New(s.host,
+			goobs.WithDialer(dialer),
+			goobs.WithResponseTimeoutDuration(rpcTimeout),
+		)
 		if err != nil {
 			s.logger.WarnContext(ctx, "obs connect failed",
 				"host", s.host, "err", err, "retry_in", backoff)

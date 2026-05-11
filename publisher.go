@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -36,6 +37,13 @@ type publishedEvent struct {
 // DMS quickshell indicator). The unix-socket implementation broadcasts
 // each Publish to every connected subscriber and sends a snapshot of
 // the most recent state to each new subscriber on connect.
+//
+// Publish returns a non-nil error only for marshal failures (which
+// would indicate a schema mismatch the daemon shouldn't ignore).
+// Per-subscriber write failures are absorbed: a broken pipe to one
+// client is not a daemon-level event and the failed subscriber is
+// silently dropped. A nil return therefore means broadcast was
+// attempted; it is NOT a delivery confirmation.
 type Publisher interface {
 	Publish(state State, refCount int, ts time.Time) error
 	Close() error
@@ -43,6 +51,7 @@ type Publisher interface {
 
 const (
 	publisherSocketMode   = 0o600
+	publisherSocketUmask  = 0o077
 	publisherWriteTimeout = time.Second
 )
 
@@ -51,6 +60,14 @@ const (
 // that start mid-session render correctly) plus every subsequent event.
 // Failed writes drop the subscriber silently — a broken pipe is normal
 // when a client exits, not a daemon-level problem.
+//
+// Lock discipline: p.mu guards p.subscribers, p.lastState, and serializes
+// all subscriber writes. registerSubscriber writes the snapshot AND adds
+// the conn to the set under a single lock-hold; Publish iterates and
+// writes under the same lock. The combination guarantees a freshly-
+// registered subscriber sees the snapshot before any subsequent
+// broadcast — preventing the ordering race where Publish could write
+// S2 to the new conn before registerSubscriber's deferred S1 lands.
 type unixSocketPublisher struct {
 	logger   *slog.Logger
 	path     string
@@ -70,12 +87,26 @@ type unixSocketPublisher struct {
 // The parent context governs lifetime: when it cancels, the loop
 // drains and the listener closes — Close finishes the teardown
 // synchronously.
+//
+// The bind is wrapped in a temporary umask of 0o077 so the socket
+// file is created restrictively from the start; the subsequent Chmod
+// is belt-and-suspenders. Without the umask wrapper, the socket would
+// be created with `0666 & ~process-umask` and could be observed by
+// same-user processes during the microsecond window before Chmod —
+// not a cross-user risk under $XDG_RUNTIME_DIR (mode 0700), but a
+// real one for explicit `--state-socket /tmp/...` configurations.
 func newPublisher(ctx context.Context, logger *slog.Logger, path string) (*unixSocketPublisher, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("remove stale socket %q: %w", path, err)
 	}
+
+	// Tighten umask for the duration of Listen so the socket is
+	// created with no group/other bits. syscall.Umask is process-wide;
+	// it returns the previous value which we restore immediately.
+	oldUmask := syscall.Umask(publisherSocketUmask)
 	var listenCfg net.ListenConfig
 	listener, err := listenCfg.Listen(ctx, "unix", path)
+	syscall.Umask(oldUmask)
 	if err != nil {
 		return nil, fmt.Errorf("listen unix %q: %w", path, err)
 	}
@@ -105,8 +136,15 @@ func newPublisher(ctx context.Context, logger *slog.Logger, path string) (*unixS
 }
 
 // Publish broadcasts the new state to every connected subscriber AND
-// updates the snapshot served to future connectors. Subscribers whose
-// write fails are dropped (broken pipe / closed conn).
+// updates the snapshot served to future connectors. Holds p.mu across
+// the per-subscriber writes; this serializes against registerSubscriber's
+// snapshot delivery, guaranteeing new subscribers see the snapshot
+// before any subsequent broadcast. See the lock-discipline comment on
+// unixSocketPublisher.
+//
+// Returns an error only if event marshaling fails. Per-subscriber write
+// failures drop the subscriber silently — see the Publisher interface
+// docstring.
 func (p *unixSocketPublisher) Publish(state State, refCount int, ts time.Time) error {
 	ev := publishedEvent{State: state, RefCount: refCount, Timestamp: ts.UTC()}
 	line, err := json.Marshal(ev)
@@ -115,18 +153,16 @@ func (p *unixSocketPublisher) Publish(state State, refCount int, ts time.Time) e
 	}
 	line = append(line, '\n')
 
-	// Snapshot the subscriber set under the lock; release before
-	// writing so a slow client doesn't block other writes.
 	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.lastState = ev
-	subs := make([]net.Conn, 0, len(p.subscribers))
 	for sub := range p.subscribers {
-		subs = append(subs, sub)
-	}
-	p.mu.Unlock()
-
-	for _, sub := range subs {
-		p.writeToSubscriber(sub, line)
+		if !p.writeLineLocked(sub, line) {
+			delete(p.subscribers, sub)
+			if cerr := sub.Close(); cerr != nil {
+				p.logger.Debug("subscriber close returned error", "err", cerr)
+			}
+		}
 	}
 	return nil
 }
@@ -179,45 +215,91 @@ func (p *unixSocketPublisher) acceptLoop(ctx context.Context) {
 	}
 }
 
-// registerSubscriber adds the conn to the subscriber set and sends
-// the current state snapshot. If the snapshot write fails, the conn
-// is dropped immediately.
+// registerSubscriber writes the current state snapshot to the new
+// subscriber and adds it to the broadcast set — all under p.mu so a
+// concurrent Publish cannot interleave a later event before our
+// snapshot lands. If the snapshot write fails, the conn is closed and
+// not added (so a slow-or-dead first read doesn't poison the set).
+//
+// A per-conn watcher goroutine is started on success to detect peer
+// disconnection via conn.Read returning EOF — without it, dead
+// subscribers would linger until the next Publish attempted a write.
 func (p *unixSocketPublisher) registerSubscriber(ctx context.Context, conn net.Conn) {
 	p.mu.Lock()
-	p.subscribers[conn] = struct{}{}
 	snapshot := p.lastState
-	p.mu.Unlock()
-
 	line, err := json.Marshal(snapshot)
 	if err != nil {
+		p.mu.Unlock()
 		p.logger.WarnContext(ctx, "marshal snapshot failed", "err", err)
-		p.dropSubscriber(conn)
+		if cerr := conn.Close(); cerr != nil {
+			p.logger.DebugContext(ctx, "subscriber close returned error", "err", cerr)
+		}
 		return
 	}
 	line = append(line, '\n')
-	p.writeToSubscriber(conn, line)
-}
-
-// writeToSubscriber writes one line to conn with a bounded deadline.
-// On failure, drops the subscriber. No logging — broken pipe on a
-// peer-closed conn is expected during normal operation.
-func (p *unixSocketPublisher) writeToSubscriber(conn net.Conn, line []byte) {
-	if err := conn.SetWriteDeadline(time.Now().Add(publisherWriteTimeout)); err != nil {
-		p.dropSubscriber(conn)
+	if !p.writeLineLocked(conn, line) {
+		p.mu.Unlock()
+		if cerr := conn.Close(); cerr != nil {
+			p.logger.DebugContext(ctx, "subscriber close returned error", "err", cerr)
+		}
 		return
 	}
+	p.subscribers[conn] = struct{}{}
+	p.mu.Unlock()
+
+	go p.watchConn(conn)
+}
+
+// writeLineLocked writes one line to conn with the configured deadline.
+// Caller must hold p.mu. Returns true on success, false on any write
+// error (caller is responsible for evicting and closing).
+func (p *unixSocketPublisher) writeLineLocked(conn net.Conn, line []byte) bool {
+	if err := conn.SetWriteDeadline(time.Now().Add(publisherWriteTimeout)); err != nil {
+		return false
+	}
 	if _, err := conn.Write(line); err != nil {
-		p.dropSubscriber(conn)
+		return false
+	}
+	return true
+}
+
+// watchConn blocks on conn.Read so we notice peer disconnection without
+// waiting for the next Publish attempt. lazycam's protocol is one-way
+// (daemon → subscriber), so any byte received is discarded; the
+// signal we care about is the error return when the peer closes.
+func (p *unixSocketPublisher) watchConn(conn net.Conn) {
+	buf := make([]byte, 1)
+	for {
+		if _, err := conn.Read(buf); err != nil {
+			p.dropSubscriber(conn)
+			return
+		}
 	}
 }
 
 // dropSubscriber removes conn from the subscriber set and closes it.
-// Safe to call multiple times for the same conn.
+// Safe to call multiple times for the same conn — second call is a
+// no-op because the conn is already absent from the set and Close on
+// an already-closed conn returns ErrClosed (downgraded to Debug).
 func (p *unixSocketPublisher) dropSubscriber(conn net.Conn) {
 	p.mu.Lock()
-	delete(p.subscribers, conn)
+	_, present := p.subscribers[conn]
+	if present {
+		delete(p.subscribers, conn)
+	}
 	p.mu.Unlock()
+	if !present {
+		return
+	}
 	if err := conn.Close(); err != nil {
 		p.logger.Debug("subscriber close returned error", "err", err)
 	}
+}
+
+// subscriberCount returns the current number of attached subscribers.
+// Intended for tests; exported within the package only.
+func (p *unixSocketPublisher) subscriberCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.subscribers)
 }

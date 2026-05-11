@@ -23,21 +23,33 @@
     devenv,
     ...
   } @ inputs:
-  # System-agnostic outputs (modules, overlays) live outside
-  # eachDefaultSystem; per-system outputs (packages, apps, devShells)
-  # live inside.
+  # System-agnostic outputs (modules, overlays, plain paths) live
+  # outside eachDefaultSystem; per-system outputs (packages, apps,
+  # devShells) live inside.
     {
       homeManagerModules = {
         default = import ./nix/home-manager-module.nix;
         lazycam = import ./nix/home-manager-module.nix;
       };
+
+      # Quickshell "modules" are import paths — there is no formal
+      # module system. Exposing the QML directory directly lets a
+      # consuming flake (DMS) reach the .qml files via
+      # `inputs.lazycam.quickshellModules.lazycam-indicator` and pass
+      # that path into its own Quickshell import context.
+      quickshellModules = {
+        default = ./quickshell/lazycam-indicator;
+        lazycam-indicator = ./quickshell/lazycam-indicator;
+      };
     }
     // flake-utils.lib.eachDefaultSystem (system: let
       pkgs = import nixpkgs {inherit system;};
       lazycam-package = pkgs.callPackage ./package.nix {};
+      lazycam-indicator-package = pkgs.callPackage ./nix/quickshell-package.nix {};
     in {
       packages = rec {
         lazycam = lazycam-package;
+        lazycam-indicator = lazycam-indicator-package;
         default = lazycam;
       };
 

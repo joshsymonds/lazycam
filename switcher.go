@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/andreykaipov/goobs"
+	"github.com/andreykaipov/goobs/api/requests/inputs"
 	"github.com/andreykaipov/goobs/api/requests/scenes"
 	"github.com/gorilla/websocket"
 )
@@ -18,9 +19,22 @@ import (
 // Switcher is the abstraction the daemon's event loop calls on
 // transitions. The dry-run implementation logs the intended action;
 // the live implementation maintains an OBS WebSocket v5 connection
-// with auto-reconnect and issues SetCurrentProgramScene RPCs.
+// with auto-reconnect and issues SetCurrentProgramScene and
+// SetInputSettings RPCs.
+//
+// SetCameraDevice gates the underlying v4l2 file descriptor by
+// rewriting the device_id setting of an OBS input source. With
+// deviceID = "/dev/video0" OBS opens the camera (hardware LED on);
+// with deviceID = "" OBS's v4l2 plugin fails the reopen and the
+// previous fd is released (LED off). This works around OBS's
+// v4l2_input plugin lacking show/hide hooks — without this gate
+// the LED would stay lit for the entire OBS process lifetime,
+// breaking lazycam's whole reason for existing. Pass sourceName=""
+// to skip the gate entirely (back-compat for setups that don't
+// want device-level gating).
 type Switcher interface {
 	SetScene(ctx context.Context, name string) error
+	SetCameraDevice(ctx context.Context, sourceName, deviceID string) error
 	Close() error
 }
 
@@ -56,6 +70,17 @@ type dryRunSwitcher struct {
 // for signature parity with the live switcher.
 func (d *dryRunSwitcher) SetScene(ctx context.Context, name string) error {
 	d.logger.InfoContext(ctx, "would set scene", "scene", name)
+	return nil
+}
+
+// SetCameraDevice logs the intended device-id rewrite. Empty
+// sourceName is a no-op (matches the live switcher's contract).
+func (d *dryRunSwitcher) SetCameraDevice(ctx context.Context, sourceName, deviceID string) error {
+	if sourceName == "" {
+		return nil
+	}
+	d.logger.InfoContext(ctx, "would set camera device",
+		"source", sourceName, "device_id", deviceID)
 	return nil
 }
 
@@ -214,6 +239,47 @@ func (s *liveSwitcher) SetScene(ctx context.Context, name string) error {
 		s.markDisconnected(client)
 		s.signalReconnect()
 		return fmt.Errorf("set scene %q: %w", name, err)
+	}
+	return nil
+}
+
+// SetCameraDevice issues a SetInputSettings RPC that overlays
+// {device_id: deviceID} onto the named source. With deviceID set to
+// the real camera path, OBS's v4l2 plugin opens the device (LED on);
+// with deviceID="" the open fails and the prior fd is released
+// (LED off). Overlay=true so other settings (pixelformat, buffering,
+// etc.) survive untouched.
+//
+// Like SetScene, drops the call (WARN) when not connected so a
+// transient OBS WebSocket loss doesn't kill the daemon.
+func (s *liveSwitcher) SetCameraDevice(ctx context.Context, sourceName, deviceID string) error {
+	if sourceName == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	client := s.client
+	s.mu.Unlock()
+
+	if client == nil {
+		s.logger.WarnContext(ctx, "obs not connected; dropping camera device set",
+			"source", sourceName, "device_id", deviceID)
+		return nil
+	}
+
+	overlay := true
+	_, err := client.Inputs.SetInputSettings(
+		inputs.NewSetInputSettingsParams().
+			WithInputName(sourceName).
+			WithInputSettings(map[string]any{"device_id": deviceID}).
+			WithOverlay(overlay),
+	)
+	if err != nil {
+		s.logger.WarnContext(ctx, "obs set input settings failed; reconnecting",
+			"source", sourceName, "device_id", deviceID, "err", err)
+		s.markDisconnected(client)
+		s.signalReconnect()
+		return fmt.Errorf("set camera device %q on %q: %w", deviceID, sourceName, err)
 	}
 	return nil
 }

@@ -38,6 +38,9 @@
     "--scene-standby=${lib.escapeShellArg cfg.sceneStandby}"
     (lib.optionalString (cfg.stateSocket != null)
       "--state-socket=${lib.escapeShellArg cfg.stateSocket}")
+    (lib.optionalString (cfg.cameraSource != "")
+      "--camera-source=${lib.escapeShellArg cfg.cameraSource}")
+    "--camera-device=${lib.escapeShellArg cfg.cameraDevice}"
     (lib.optionalString cfg.dryRun "--dry-run")
     (lib.optionalString cfg.debug "--debug")
   ]);
@@ -112,6 +115,34 @@ in {
         Optional UNIX socket path where lazycam publishes newline-
         delimited JSON state events for external indicators. When null,
         the daemon defaults to $XDG_RUNTIME_DIR/lazycam.sock at runtime.
+      '';
+    };
+
+    cameraSource = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "Real Webcam";
+      description = ''
+        OBS input source name to device-id-gate via SetInputSettings.
+        Empty disables device-level gating — leave empty if the
+        Standby/Active scene swap alone is sufficient for your use
+        case, set to the source name when the underlying camera plugin
+        keeps the device open across scenes (OBS's v4l2_input plugin
+        in particular has no show/hide hooks, so without this gate
+        the hardware LED stays lit while OBS runs regardless of
+        which scene is the program scene).
+      '';
+    };
+
+    cameraDevice = lib.mkOption {
+      type = lib.types.str;
+      default = "/dev/video0";
+      example = "/dev/video0";
+      description = ''
+        v4l2 device path written to the gated OBS source on Activate
+        transitions. On Deactivate the source's device_id is cleared,
+        which makes OBS's v4l2 plugin release the prior file
+        descriptor — the kernel turns off the hardware LED.
       '';
     };
 

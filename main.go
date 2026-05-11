@@ -35,6 +35,8 @@ type config struct {
 	sceneStandby string
 	obsURL       string
 	stateSocket  string
+	cameraSource string
+	cameraDevice string
 	dryRun       bool
 	debug        bool
 }
@@ -48,6 +50,8 @@ type daemon struct {
 	tracker      Tracker
 	sceneActive  string
 	sceneStandby string
+	cameraSource string
+	cameraDevice string
 }
 
 func main() {
@@ -66,6 +70,10 @@ func main() {
 		"log every inotify event (otherwise only 0↔N transitions are logged)")
 	flag.StringVar(&cfg.stateSocket, "state-socket", "",
 		"UNIX socket path to publish state events on (default $XDG_RUNTIME_DIR/lazycam.sock)")
+	flag.StringVar(&cfg.cameraSource, "camera-source", "",
+		"OBS input name to gate via device-id swap; empty disables device-level gating")
+	flag.StringVar(&cfg.cameraDevice, "camera-device", "/dev/video0",
+		"v4l2 device path written on Activate; cleared on Deactivate to release the LED")
 	flag.Parse()
 
 	if cfg.stateSocket == "" {
@@ -165,6 +173,8 @@ func run(logger *slog.Logger, cfg config) error {
 		publisher:    publisher,
 		sceneActive:  cfg.sceneActive,
 		sceneStandby: cfg.sceneStandby,
+		cameraSource: cfg.cameraSource,
+		cameraDevice: cfg.cameraDevice,
 	}
 	for {
 		select {
@@ -192,6 +202,14 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 		d.logger.InfoContext(ctx, "activate",
 			"kind", describeMask(ev.Mask),
 			"ref_count", d.tracker.RefCount())
+		// Order: open the device BEFORE switching to the Active
+		// scene, so that when the scene becomes visible the source
+		// already holds a live capture. If we switched scene first,
+		// the user would see a black frame for ~1 RPC round-trip.
+		if err := d.switcher.SetCameraDevice(ctx, d.cameraSource, d.cameraDevice); err != nil {
+			d.logger.WarnContext(ctx, "open camera failed",
+				"source", d.cameraSource, "err", err)
+		}
 		if err := d.switcher.SetScene(ctx, d.sceneActive); err != nil {
 			d.logger.WarnContext(ctx, "set scene failed",
 				"scene", d.sceneActive, "err", err)
@@ -203,9 +221,17 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 		d.logger.InfoContext(ctx, "deactivate",
 			"kind", describeMask(ev.Mask),
 			"ref_count", d.tracker.RefCount())
+		// Order: switch to Standby BEFORE closing the device, so OBS
+		// hides the (still-live) source before its fd is torn down.
+		// Reversed order would briefly show the source in an error
+		// state until the scene flip lands.
 		if err := d.switcher.SetScene(ctx, d.sceneStandby); err != nil {
 			d.logger.WarnContext(ctx, "set scene failed",
 				"scene", d.sceneStandby, "err", err)
+		}
+		if err := d.switcher.SetCameraDevice(ctx, d.cameraSource, ""); err != nil {
+			d.logger.WarnContext(ctx, "close camera failed",
+				"source", d.cameraSource, "err", err)
 		}
 		if err := d.publisher.Publish(StateIdle, d.tracker.RefCount(), time.Now()); err != nil {
 			d.logger.WarnContext(ctx, "publish failed", "state", StateIdle, "err", err)

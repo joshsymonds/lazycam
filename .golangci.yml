@@ -248,6 +248,7 @@ linters:
         - ctx
         - mu
         - n
+        - d # idiomatic local for *daemon (receiver name also `d`)
       ignore-decls:
         - i int
         - j int
@@ -361,6 +362,9 @@ linters:
         - stdlib
         - anon
         - any
+        # newSwitcher legitimately returns different concrete types
+        # (dryRunSwitcher / future liveSwitcher) depending on mode.
+        - github.com/joshsymonds/lazycam.Switcher
 
     wrapcheck:
       ignore-sigs:

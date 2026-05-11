@@ -25,10 +25,16 @@ import (
 func main() {
 	device := flag.String("device", "/dev/video10",
 		"v4l2 device path to watch for opens/closes")
+	debug := flag.Bool("debug", false,
+		"log every inotify event (otherwise only 0↔N transitions are logged)")
 	flag.Parse()
 
+	level := slog.LevelInfo
+	if *debug {
+		level = slog.LevelDebug
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: level,
 	}))
 
 	if err := run(logger, *device); err != nil {
@@ -78,18 +84,41 @@ func run(logger *slog.Logger, device string) error {
 	readErr := make(chan error, 1)
 	go readLoop(fd, events, readErr)
 
+	var tracker Tracker
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("shutting down")
 			return nil
 		case ev := <-events:
-			logger.Info("event",
-				"kind", describeMask(ev.Mask),
-				"mask", fmt.Sprintf("0x%x", ev.Mask))
+			handleEvent(logger, &tracker, ev)
 		case err := <-readErr:
 			return fmt.Errorf("inotify read: %w", err)
 		}
+	}
+}
+
+// handleEvent folds one inotify event into the tracker and logs at the
+// right granularity. Activate / Deactivate transitions always log at
+// INFO so an operator running without --debug still sees the events
+// that actually change the daemon's effect on the world. None-events
+// (e.g. a second concurrent open) log at DEBUG only.
+func handleEvent(logger *slog.Logger, tracker *Tracker, ev unix.InotifyEvent) {
+	transition := tracker.Apply(ev.Mask)
+	switch transition {
+	case TransitionActivate:
+		logger.Info("activate",
+			"kind", describeMask(ev.Mask),
+			"ref_count", tracker.RefCount())
+	case TransitionDeactivate:
+		logger.Info("deactivate",
+			"kind", describeMask(ev.Mask),
+			"ref_count", tracker.RefCount())
+	case TransitionNone:
+		logger.Debug("event",
+			"kind", describeMask(ev.Mask),
+			"mask", fmt.Sprintf("0x%x", ev.Mask),
+			"ref_count", tracker.RefCount())
 	}
 }
 

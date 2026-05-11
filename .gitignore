@@ -1,0 +1,25 @@
+# nix
+result
+result-*
+
+# devenv / direnv
+.devenv/
+.direnv/
+
+# local overrides
+.envrc.local
+
+# go build artifacts
+/lazycam
+*.test
+*.out
+coverage.*
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# os
+.DS_Store

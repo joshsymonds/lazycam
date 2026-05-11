@@ -250,6 +250,7 @@ linters:
         - n
         - d # idiomatic local for *daemon (receiver name also `d`)
         - s # idiomatic local for *liveSwitcher (receiver name also `s`)
+        - p # idiomatic local for *unixSocketPublisher (receiver name also `p`)
       ignore-decls:
         - i int
         - j int

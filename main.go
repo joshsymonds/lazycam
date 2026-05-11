@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -33,6 +34,7 @@ type config struct {
 	sceneActive  string
 	sceneStandby string
 	obsURL       string
+	stateSocket  string
 	dryRun       bool
 	debug        bool
 }
@@ -42,6 +44,7 @@ type config struct {
 type daemon struct {
 	logger       *slog.Logger
 	switcher     Switcher
+	publisher    Publisher
 	tracker      Tracker
 	sceneActive  string
 	sceneStandby string
@@ -61,7 +64,19 @@ func main() {
 		"log intended scene transitions instead of contacting OBS")
 	flag.BoolVar(&cfg.debug, "debug", false,
 		"log every inotify event (otherwise only 0↔N transitions are logged)")
+	flag.StringVar(&cfg.stateSocket, "state-socket", "",
+		"UNIX socket path to publish state events on (default $XDG_RUNTIME_DIR/lazycam.sock)")
 	flag.Parse()
+
+	if cfg.stateSocket == "" {
+		runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+		if runtimeDir == "" {
+			fmt.Fprintln(os.Stderr,
+				"lazycam: XDG_RUNTIME_DIR is unset and --state-socket not provided")
+			os.Exit(1)
+		}
+		cfg.stateSocket = runtimeDir + "/lazycam.sock"
+	}
 
 	level := slog.LevelInfo
 	if cfg.debug {
@@ -104,6 +119,16 @@ func run(logger *slog.Logger, cfg config) error {
 		}
 	}()
 
+	publisher, err := newPublisher(ctx, logger, cfg.stateSocket)
+	if err != nil {
+		return fmt.Errorf("publisher: %w", err)
+	}
+	defer func() {
+		if cerr := publisher.Close(); cerr != nil {
+			logger.Warn("publisher close failed", "err", cerr)
+		}
+	}()
+
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
 	if err != nil {
 		return fmt.Errorf("inotify_init1: %w", err)
@@ -139,6 +164,7 @@ func run(logger *slog.Logger, cfg config) error {
 	d := &daemon{
 		logger:       logger,
 		switcher:     switcher,
+		publisher:    publisher,
 		sceneActive:  cfg.sceneActive,
 		sceneStandby: cfg.sceneStandby,
 	}
@@ -172,6 +198,9 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 			d.logger.WarnContext(ctx, "set scene failed",
 				"scene", d.sceneActive, "err", err)
 		}
+		if err := d.publisher.Publish(StateActive, d.tracker.RefCount(), time.Now()); err != nil {
+			d.logger.WarnContext(ctx, "publish failed", "state", StateActive, "err", err)
+		}
 	case TransitionDeactivate:
 		d.logger.InfoContext(ctx, "deactivate",
 			"kind", describeMask(ev.Mask),
@@ -179,6 +208,9 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 		if err := d.switcher.SetScene(ctx, d.sceneStandby); err != nil {
 			d.logger.WarnContext(ctx, "set scene failed",
 				"scene", d.sceneStandby, "err", err)
+		}
+		if err := d.publisher.Publish(StateIdle, d.tracker.RefCount(), time.Now()); err != nil {
+			d.logger.WarnContext(ctx, "publish failed", "state", StateIdle, "err", err)
 		}
 	case TransitionNone:
 		d.logger.DebugContext(ctx, "event",

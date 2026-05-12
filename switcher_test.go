@@ -60,8 +60,9 @@ func TestLiveSwitcher_SetSceneBeforeConnectedDoesNotPanic(t *testing.T) {
 	// Port 1 is the TCPMUX well-known port — nothing listens by default,
 	// and connection failure is fast (ECONNREFUSED rather than timeout).
 	sw, err := newSwitcher(ctx, logger, switcherOptions{
-		dryRun: false,
-		obsURL: "ws://127.0.0.1:1",
+		dryRun:     false,
+		obsURL:     "ws://127.0.0.1:1",
+		maxBackoff: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("newSwitcher: %v", err)
@@ -98,6 +99,12 @@ func TestExtractHost(t *testing.T) {
 		{name: "wss scheme", input: "wss://127.0.0.1:4455", want: "127.0.0.1:4455"},
 		{name: "bare host port", input: "127.0.0.1:4455", want: "127.0.0.1:4455"},
 		{name: "localhost", input: "ws://localhost:4455", want: "localhost:4455"},
+		// IPv6 bracket form: net/url returns Host with the brackets
+		// preserved (e.g. "[::1]:4455"), which is what net.Dial expects
+		// for a bracketed-host:port. Pin the bracket-preservation so a
+		// future refactor of extractHost doesn't accidentally strip them.
+		{name: "ws scheme ipv6", input: "ws://[::1]:4455", want: "[::1]:4455"},
+		{name: "wss scheme ipv6", input: "wss://[::1]:4455", want: "[::1]:4455"},
 		{name: "empty", input: "", wantErr: true},
 		{name: "no port", input: "ws://obs", wantErr: true},
 		{name: "no port bare", input: "obs", wantErr: true},
@@ -161,8 +168,9 @@ func TestLiveSwitcher_CloseBeforeConnect(t *testing.T) {
 	defer cancel()
 
 	sw, err := newSwitcher(ctx, logger, switcherOptions{
-		dryRun: false,
-		obsURL: "ws://127.0.0.1:1",
+		dryRun:     false,
+		obsURL:     "ws://127.0.0.1:1",
+		maxBackoff: 30 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("newSwitcher: %v", err)

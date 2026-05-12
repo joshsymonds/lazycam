@@ -43,6 +43,7 @@
     "--camera-device=${lib.escapeShellArg cfg.cameraDevice}"
     (lib.optionalString (cfg.excludeComms != [])
       "--exclude-comms=${lib.escapeShellArg (lib.concatStringsSep "," cfg.excludeComms)}")
+    "--reconnect-max-backoff=${cfg.reconnectMaxBackoff}"
     (lib.optionalString cfg.dryRun "--dry-run")
     (lib.optionalString cfg.debug "--debug")
   ]);
@@ -173,6 +174,21 @@ in {
         Default is the empty list — every opener counts. This
         preserves backwards-compatible behavior on hosts that don't
         auto-start OBS.
+      '';
+    };
+
+    reconnectMaxBackoff = lib.mkOption {
+      type = lib.types.str;
+      default = "30s";
+      example = "60s";
+      description = ''
+        Cap for the exponential-backoff sleep between OBS WebSocket
+        reconnect attempts. Accepts any Go time.Duration string
+        ("250ms", "5s", "2m", etc.). Default 30s is a sensible
+        ceiling for a workstation-local OBS that's expected to be up
+        most of the time; raise it for setups where OBS may be down
+        for longer stretches and you'd rather not have lazycam wake
+        the CPU every 30s to retry.
       '';
     };
 

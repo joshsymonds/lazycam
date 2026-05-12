@@ -142,6 +142,14 @@ func (s *ProcScanner) processHolds(ctx context.Context, pid string) bool {
 		return true
 	}
 	comm := strings.TrimRight(string(commBytes), "\n")
+	// Adversarial race: any same-uid process can set its own comm via
+	// prctl(PR_SET_NAME, ...). A hostile consumer could rename itself
+	// to a producer string (e.g. ".obs-wrapped") just before opening
+	// /dev/video10 and evade the LED hint. This is the documented
+	// soft-privacy boundary — comm matching is a UX signal, not a
+	// security control. Hard enforcement would require either a
+	// PID-tracked exclusion (knowing OBS's real PID at startup) or a
+	// uid/cgroup-scoped policy that's out of scope here.
 	if _, excluded := s.excludeComms[comm]; excluded {
 		return false
 	}

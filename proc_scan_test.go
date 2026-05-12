@@ -184,3 +184,45 @@ func TestProcScanner_MissingProcRootErrors(t *testing.T) {
 		t.Errorf("Count() error = %q, want substring 'read'", err.Error())
 	}
 }
+
+// TestProcScanner_UnreadableCommCountsAsConsumer pins the defensive
+// branch at proc_scan.go:processHolds when comm cannot be read (the
+// process disappeared between the fd-walk and the comm-read). The
+// privacy contract is "better to mistakenly leave the LED on than to
+// miss a real one" — so the unknown process counts as a consumer.
+//
+// We simulate the unreadable comm by building a fake-proc tree
+// manually here (bypassing buildFakeProc which always writes comm)
+// and giving the comm file mode 0 so ReadFile returns EACCES.
+func TestProcScanner_UnreadableCommCountsAsConsumer(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	pid := "800"
+	procDir := filepath.Join(root, pid)
+	if err := os.MkdirAll(filepath.Join(procDir, "fd"), 0o755); err != nil {
+		t.Fatalf("mkdir %s/fd: %v", procDir, err)
+	}
+	if err := os.Symlink(testDevice,
+		filepath.Join(procDir, "fd", "3")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Mode 0 → ReadFile returns EACCES when running as non-root. Tests
+	// run unprivileged under the standard nix devShell user.
+	if err := os.WriteFile(
+		filepath.Join(procDir, "comm"), []byte("zoom\n"), 0o000,
+	); err != nil {
+		t.Fatalf("write comm: %v", err)
+	}
+
+	// Even with an exclusion list that *would* filter out the
+	// process if its comm were readable, the unreadable-comm branch
+	// must conservatively count it.
+	s := newTestScanner(t, []string{"zoom"}, root)
+	got, err := s.Count(context.Background())
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("Count = %d, want 1 (unreadable comm → count as consumer)", got)
+	}
+}

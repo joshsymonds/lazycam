@@ -39,13 +39,14 @@ type Switcher interface {
 }
 
 // switcherOptions carries everything the constructor needs across
-// modes. dryRun gates the implementation; obsURL is consumed by the
-// live switcher only. Scene names are owned by the daemon (not the
-// Switcher) since each transition picks one — the switcher's API is
-// stateless `SetScene(ctx, name)`.
+// modes. dryRun gates the implementation; obsURL and maxBackoff are
+// consumed by the live switcher only. Scene names are owned by the
+// daemon (not the Switcher) since each transition picks one — the
+// switcher's API is stateless `SetScene(ctx, name)`.
 type switcherOptions struct {
-	dryRun bool
-	obsURL string
+	dryRun     bool
+	obsURL     string
+	maxBackoff time.Duration
 }
 
 // newSwitcher returns the appropriate Switcher for the requested mode.
@@ -105,6 +106,11 @@ type liveSwitcher struct {
 	logger *slog.Logger
 	host   string // host:port; scheme stripped from the configured URL
 
+	// maxBackoff caps reconnect-retry sleeps. Configurable per the
+	// epic's "all operational values are CLI flags" requirement;
+	// threaded in via switcherOptions.maxBackoff.
+	maxBackoff time.Duration
+
 	mu     sync.Mutex
 	client *goobs.Client // nil while disconnected
 
@@ -117,7 +123,6 @@ type liveSwitcher struct {
 
 const (
 	initialBackoff    = time.Second
-	maxBackoff        = 30 * time.Second
 	backoffMultiplier = 2
 
 	// handshakeTimeout bounds the worst-case time goobs.New can block.
@@ -140,13 +145,17 @@ func newLiveSwitcher(parentCtx context.Context, logger *slog.Logger, opts switch
 	if lerr := requireLoopback(host); lerr != nil {
 		return nil, fmt.Errorf("obs-url is not loopback: %w", lerr)
 	}
+	if opts.maxBackoff <= 0 {
+		return nil, fmt.Errorf("maxBackoff must be > 0, got %s", opts.maxBackoff)
+	}
 	ctx, cancel := context.WithCancel(parentCtx)
 	s := &liveSwitcher{
-		logger:    logger,
-		host:      host,
-		reconnect: make(chan struct{}, 1),
-		cancel:    cancel,
-		done:      make(chan struct{}),
+		logger:     logger,
+		host:       host,
+		maxBackoff: opts.maxBackoff,
+		reconnect:  make(chan struct{}, 1),
+		cancel:     cancel,
+		done:       make(chan struct{}),
 	}
 	go s.connectLoop(ctx)
 	return s, nil
@@ -320,7 +329,7 @@ func (s *liveSwitcher) connectLoop(ctx context.Context) {
 			if !sleepCtx(ctx, backoff) {
 				return
 			}
-			backoff = nextBackoff(backoff)
+			backoff = nextBackoff(backoff, s.maxBackoff)
 			continue
 		}
 
@@ -396,11 +405,11 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// nextBackoff doubles the current backoff, capped at maxBackoff.
-func nextBackoff(current time.Duration) time.Duration {
+// nextBackoff doubles the current backoff, capped at limit.
+func nextBackoff(current, limit time.Duration) time.Duration {
 	doubled := current * backoffMultiplier
-	if doubled > maxBackoff {
-		return maxBackoff
+	if doubled > limit {
+		return limit
 	}
 	return doubled
 }

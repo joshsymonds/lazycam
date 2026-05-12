@@ -34,12 +34,13 @@ V1 functional. The daemon:
   `systemd --user` service, and a `quickshellModules.lazycam-indicator`
   output for Quickshell-based bar widgets
 
-Open work: the daemon does not yet bootstrap its ref-count from a
-`/proc/*/fd/` scan at startup, so a daemon-restart-while-consumers-attached
-could miss the initial open event (the ref-count clamps at zero on the
-later close — defensive, but the daemon will report `idle` until the
-next attach). Real-world LED verification on multi-app workflows is
-tracked separately.
+On startup the daemon takes a `/proc` snapshot before entering the
+inotify loop, so a daemon-restart while consumers are already attached
+correctly emits an `activate` and opens the camera. Subsequent inotify
+events re-trigger the same `/proc` scan — `--exclude-comms` filters
+out producer processes (typically OBS itself, which holds the
+v4l2loopback open as a writer) so the camera LED only lights for real
+consumers.
 
 ## Build
 

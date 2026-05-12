@@ -1,13 +1,16 @@
 // Command lazycam — on-demand v4l2loopback producer gating.
 //
-// Watches a v4l2 device (default /dev/video10) with inotify, maintains
-// a consumer ref-count, and asks OBS to switch scenes on 0↔N
-// transitions so the real camera handle (and its hardware LED) is only
-// held while something is actually using the loopback.
+// Watches a v4l2 device (default /dev/video10) with inotify and, on
+// each event, snapshots /proc to count current openers (filtering
+// producers by process comm via --exclude-comms). On 0→N transitions
+// the daemon asks OBS via WebSocket v5 to switch to the configured
+// "active" scene and rewrites the gated source's device_id to open
+// the real camera; on N→0 it does the inverse. The real camera fd
+// (and its hardware LED) is therefore only held while a non-producer
+// consumer is actually reading the loopback.
 //
-// Live OBS WebSocket integration arrives in task #5; this iteration
-// wires the Switcher abstraction with a dry-run implementation that
-// logs intended scene transitions.
+// --dry-run mode logs intended scene/device transitions instead of
+// contacting OBS — useful for smoke tests and config validation.
 //
 // See https://github.com/joshsymonds/lazycam for the design epic.
 package main
@@ -39,6 +42,7 @@ type config struct {
 	cameraSource string
 	cameraDevice string
 	excludeComms string
+	maxBackoff   time.Duration
 	dryRun       bool
 	debug        bool
 }
@@ -80,6 +84,8 @@ func main() {
 	flag.StringVar(&cfg.excludeComms, "exclude-comms", "",
 		"comma-separated process comm strings to exclude from consumer ref-count "+
 			"(typically the OBS producer wrapper, e.g. .obs-wrapped); empty counts all openers")
+	flag.DurationVar(&cfg.maxBackoff, "reconnect-max-backoff", 30*time.Second,
+		"cap for exponential-backoff sleep between OBS WebSocket reconnect attempts")
 	flag.Parse()
 
 	if cfg.stateSocket == "" {
@@ -119,8 +125,9 @@ func run(logger *slog.Logger, cfg config) error {
 	defer stop()
 
 	switcher, err := newSwitcher(ctx, logger, switcherOptions{
-		dryRun: cfg.dryRun,
-		obsURL: cfg.obsURL,
+		dryRun:     cfg.dryRun,
+		obsURL:     cfg.obsURL,
+		maxBackoff: cfg.maxBackoff,
 	})
 	if err != nil {
 		return fmt.Errorf("switcher: %w", err)

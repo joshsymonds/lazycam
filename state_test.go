@@ -1,95 +1,79 @@
 package main
 
-import (
-	"testing"
+import "testing"
 
-	"golang.org/x/sys/unix"
-)
-
-func TestTracker_SingleOpenActivates(t *testing.T) {
+func TestTracker_ZeroToOneActivates(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	if got := tr.Apply(unix.IN_OPEN); got != TransitionActivate {
-		t.Errorf("Apply(IN_OPEN) = %v, want Activate", got)
+	if got := tr.Update(1); got != TransitionActivate {
+		t.Errorf("Update(1) from zero = %v, want Activate", got)
 	}
-	if got := tr.RefCount(); got != 1 {
-		t.Errorf("RefCount = %d, want 1", got)
+	if got := tr.Count(); got != 1 {
+		t.Errorf("Count = %d, want 1", got)
 	}
 }
 
-func TestTracker_OpenThenCloseDeactivates(t *testing.T) {
+func TestTracker_OneToZeroDeactivates(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	if got := tr.Apply(unix.IN_OPEN); got != TransitionActivate {
-		t.Errorf("first Apply = %v, want Activate", got)
+	_ = tr.Update(1)
+	if got := tr.Update(0); got != TransitionDeactivate {
+		t.Errorf("Update(0) from one = %v, want Deactivate", got)
 	}
-	if got := tr.Apply(unix.IN_CLOSE_NOWRITE); got != TransitionDeactivate {
-		t.Errorf("second Apply = %v, want Deactivate", got)
-	}
-	if got := tr.RefCount(); got != 0 {
-		t.Errorf("RefCount = %d, want 0", got)
+	if got := tr.Count(); got != 0 {
+		t.Errorf("Count = %d, want 0", got)
 	}
 }
 
-func TestTracker_TwoOpensThenTwoCloses(t *testing.T) {
+func TestTracker_OneToTwoIsNone(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	type step struct {
-		mask uint32
-		want Transition
+	_ = tr.Update(1)
+	if got := tr.Update(2); got != TransitionNone {
+		t.Errorf("Update(2) from one = %v, want None (still active)", got)
 	}
-	seq := []step{
-		{unix.IN_OPEN, TransitionActivate},
-		{unix.IN_OPEN, TransitionNone},
-		{unix.IN_CLOSE_NOWRITE, TransitionNone},
-		{unix.IN_CLOSE_NOWRITE, TransitionDeactivate},
-	}
-	for i, s := range seq {
-		if got := tr.Apply(s.mask); got != s.want {
-			t.Errorf("step %d: Apply(%#x) = %v, want %v", i, s.mask, got, s.want)
-		}
-	}
-	if got := tr.RefCount(); got != 0 {
-		t.Errorf("RefCount = %d, want 0", got)
+	if got := tr.Count(); got != 2 {
+		t.Errorf("Count = %d, want 2", got)
 	}
 }
 
-func TestTracker_UnbalancedCloseClampsAtZero(t *testing.T) {
+func TestTracker_TwoToOneIsNone(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	if got := tr.Apply(unix.IN_CLOSE_NOWRITE); got != TransitionNone {
-		t.Errorf("Apply on empty = %v, want None", got)
+	_ = tr.Update(2)
+	if got := tr.Update(1); got != TransitionNone {
+		t.Errorf("Update(1) from two = %v, want None (still active)", got)
 	}
-	if got := tr.RefCount(); got != 0 {
-		t.Errorf("RefCount = %d, want 0 (clamped)", got)
+	if got := tr.Count(); got != 1 {
+		t.Errorf("Count = %d, want 1", got)
 	}
 }
 
-func TestTracker_MixedCloseVariantsBothDecrement(t *testing.T) {
+func TestTracker_ZeroToZeroIsNone(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	_ = tr.Apply(unix.IN_OPEN)
-	_ = tr.Apply(unix.IN_OPEN)
-	if got := tr.Apply(unix.IN_CLOSE_NOWRITE); got != TransitionNone {
-		t.Errorf("first close (NOWRITE) = %v, want None", got)
-	}
-	if got := tr.Apply(unix.IN_CLOSE_WRITE); got != TransitionDeactivate {
-		t.Errorf("second close (WRITE) = %v, want Deactivate", got)
-	}
-	if got := tr.RefCount(); got != 0 {
-		t.Errorf("RefCount = %d, want 0", got)
+	if got := tr.Update(0); got != TransitionNone {
+		t.Errorf("Update(0) on fresh tracker = %v, want None", got)
 	}
 }
 
-func TestTracker_UnknownMaskIgnored(t *testing.T) {
+func TestTracker_NegativeCountClampsAtZero(t *testing.T) {
 	t.Parallel()
 	var tr Tracker
-	_ = tr.Apply(unix.IN_OPEN)
-	if got := tr.Apply(unix.IN_ACCESS); got != TransitionNone {
-		t.Errorf("Apply(IN_ACCESS) = %v, want None", got)
+	if got := tr.Update(-3); got != TransitionNone {
+		t.Errorf("Update(-3) = %v, want None (clamped)", got)
 	}
-	if got := tr.RefCount(); got != 1 {
-		t.Errorf("RefCount = %d, want 1 (unchanged)", got)
+	if got := tr.Count(); got != 0 {
+		t.Errorf("Count = %d, want 0 (clamped)", got)
+	}
+}
+
+func TestTracker_DropFromTwoToZeroDeactivates(t *testing.T) {
+	t.Parallel()
+	var tr Tracker
+	_ = tr.Update(2)
+	if got := tr.Update(0); got != TransitionDeactivate {
+		t.Errorf("Update(0) from two = %v, want Deactivate", got)
 	}
 }
 

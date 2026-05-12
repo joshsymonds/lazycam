@@ -41,6 +41,8 @@
     (lib.optionalString (cfg.cameraSource != "")
       "--camera-source=${lib.escapeShellArg cfg.cameraSource}")
     "--camera-device=${lib.escapeShellArg cfg.cameraDevice}"
+    (lib.optionalString (cfg.excludeComms != [])
+      "--exclude-comms=${lib.escapeShellArg (lib.concatStringsSep "," cfg.excludeComms)}")
     (lib.optionalString cfg.dryRun "--dry-run")
     (lib.optionalString cfg.debug "--debug")
   ]);
@@ -143,6 +145,34 @@ in {
         transitions. On Deactivate the source's device_id is cleared,
         which makes OBS's v4l2 plugin release the prior file
         descriptor — the kernel turns off the hardware LED.
+      '';
+    };
+
+    excludeComms = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = [".obs-wrapped"];
+      description = ''
+        Process comm strings whose opens of the watched device are NOT
+        counted toward the consumer ref-count.
+
+        Required for hosts that auto-start OBS + the OBS Virtual
+        Camera output: OBS itself opens the v4l2 loopback as a
+        producer, which would otherwise pin lazycam in the Active
+        state for as long as OBS runs (defeating the LED-off
+        invariant). Listing OBS's comm here makes lazycam treat that
+        open as background noise, so the LED only lights when
+        something other than OBS (Zoom, Meet, ffmpeg, ...) attaches
+        to the loopback.
+
+        comm strings come from `/proc/PID/comm` (truncated to 15
+        chars by TASK_COMM_LEN). On a nix-wrapped OBS install the
+        value is typically `.obs-wrapped`; verify on your system with
+            cat /proc/$(pgrep -f obs | head -1)/comm
+
+        Default is the empty list — every opener counts. This
+        preserves backwards-compatible behavior on hosts that don't
+        auto-start OBS.
       '';
     };
 

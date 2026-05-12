@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -37,6 +38,7 @@ type config struct {
 	stateSocket  string
 	cameraSource string
 	cameraDevice string
+	excludeComms string
 	dryRun       bool
 	debug        bool
 }
@@ -47,6 +49,7 @@ type daemon struct {
 	logger       *slog.Logger
 	switcher     Switcher
 	publisher    Publisher
+	scanner      *ProcScanner
 	tracker      Tracker
 	sceneActive  string
 	sceneStandby string
@@ -74,6 +77,9 @@ func main() {
 		"OBS input name to gate via device-id swap; empty disables device-level gating")
 	flag.StringVar(&cfg.cameraDevice, "camera-device", "/dev/video0",
 		"v4l2 device path written on Activate; cleared on Deactivate to release the LED")
+	flag.StringVar(&cfg.excludeComms, "exclude-comms", "",
+		"comma-separated process comm strings to exclude from consumer ref-count "+
+			"(typically the OBS producer wrapper, e.g. .obs-wrapped); empty counts all openers")
 	flag.Parse()
 
 	if cfg.stateSocket == "" {
@@ -159,7 +165,11 @@ func run(logger *slog.Logger, cfg config) error {
 		}
 	}()
 
-	logger.Info("watching", "device", cfg.device)
+	excludeComms := splitCSV(cfg.excludeComms)
+	scanner := NewProcScanner(cfg.device, excludeComms, logger)
+	logger.Info("watching",
+		"device", cfg.device,
+		"exclude_comms", excludeComms)
 
 	// inotify reads block; do them on a goroutine and surface results on
 	// channels so the main loop can select on ctx for shutdown.
@@ -171,11 +181,19 @@ func run(logger *slog.Logger, cfg config) error {
 		logger:       logger,
 		switcher:     switcher,
 		publisher:    publisher,
+		scanner:      scanner,
 		sceneActive:  cfg.sceneActive,
 		sceneStandby: cfg.sceneStandby,
 		cameraSource: cfg.cameraSource,
 		cameraDevice: cfg.cameraDevice,
 	}
+
+	// Initial scan: catch consumers that were already attached before
+	// the daemon started. Without this, a long-running Zoom session
+	// that predates lazycam would never trip the activate transition
+	// until some unrelated open/close churned the device.
+	d.reconcile(ctx, "startup")
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -189,19 +207,53 @@ func run(logger *slog.Logger, cfg config) error {
 	}
 }
 
-// handleEvent folds one inotify event into the tracker and dispatches.
-// Activate / Deactivate transitions always log at INFO so an operator
-// running without --debug still sees the events that actually change
-// the daemon's effect on the world; None-events log at DEBUG only.
-// Switcher errors are warned, not fatal — a transient OBS WebSocket
-// failure shouldn't kill the daemon.
+// splitCSV parses a comma-separated CLI flag into a clean slice. Empty
+// input returns nil rather than []string{""} so downstream callers can
+// treat "no exclusions" and "explicit empty" identically.
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// handleEvent reacts to one inotify event by re-scanning /proc and
+// folding the new consumer count into the tracker. The mask is purely
+// diagnostic now — the state machine drives off the scanned count, not
+// off whether the event was open or close. Driving off the scan instead
+// of the mask lets us filter producer-opens (OBS writing into the
+// loopback) without per-event bookkeeping, and self-heals after any
+// missed event.
 func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
-	transition := d.tracker.Apply(ev.Mask)
+	d.reconcile(ctx, describeMask(ev.Mask))
+}
+
+// reconcile rescans /proc, updates the tracker, and fires any 0↔N
+// transition. The trigger string identifies what caused the rescan
+// ("startup", "IN_OPEN", "IN_CLOSE_NOWRITE", etc.) and shows up in log
+// fields for postmortem reasoning. Switcher errors are warned, not
+// fatal — a transient OBS WebSocket hiccup shouldn't kill the daemon.
+func (d *daemon) reconcile(ctx context.Context, trigger string) {
+	count, err := d.scanner.Count(ctx)
+	if err != nil {
+		d.logger.WarnContext(ctx, "proc scan failed; using last-known count",
+			"trigger", trigger, "err", err)
+		// Don't update the tracker on scan failure — we'd risk
+		// emitting spurious transitions based on bogus counts.
+		return
+	}
+	transition := d.tracker.Update(count)
 	switch transition {
 	case TransitionActivate:
 		d.logger.InfoContext(ctx, "activate",
-			"kind", describeMask(ev.Mask),
-			"ref_count", d.tracker.RefCount())
+			"trigger", trigger, "consumers", count)
 		// Order: open the device BEFORE switching to the Active
 		// scene, so that when the scene becomes visible the source
 		// already holds a live capture. If we switched scene first,
@@ -214,13 +266,12 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 			d.logger.WarnContext(ctx, "set scene failed",
 				"scene", d.sceneActive, "err", err)
 		}
-		if err := d.publisher.Publish(StateActive, d.tracker.RefCount(), time.Now()); err != nil {
+		if err := d.publisher.Publish(StateActive, count, time.Now()); err != nil {
 			d.logger.WarnContext(ctx, "publish failed", "state", StateActive, "err", err)
 		}
 	case TransitionDeactivate:
 		d.logger.InfoContext(ctx, "deactivate",
-			"kind", describeMask(ev.Mask),
-			"ref_count", d.tracker.RefCount())
+			"trigger", trigger, "consumers", count)
 		// Order: switch to Standby BEFORE closing the device, so OBS
 		// hides the (still-live) source before its fd is torn down.
 		// Reversed order would briefly show the source in an error
@@ -233,14 +284,12 @@ func (d *daemon) handleEvent(ctx context.Context, ev unix.InotifyEvent) {
 			d.logger.WarnContext(ctx, "close camera failed",
 				"source", d.cameraSource, "err", err)
 		}
-		if err := d.publisher.Publish(StateIdle, d.tracker.RefCount(), time.Now()); err != nil {
+		if err := d.publisher.Publish(StateIdle, count, time.Now()); err != nil {
 			d.logger.WarnContext(ctx, "publish failed", "state", StateIdle, "err", err)
 		}
 	case TransitionNone:
-		d.logger.DebugContext(ctx, "event",
-			"kind", describeMask(ev.Mask),
-			"mask", fmt.Sprintf("0x%x", ev.Mask),
-			"ref_count", d.tracker.RefCount())
+		d.logger.DebugContext(ctx, "rescan",
+			"trigger", trigger, "consumers", count)
 	}
 }
 

@@ -201,13 +201,26 @@ func run(logger *slog.Logger, cfg config) error {
 	// until some unrelated open/close churned the device.
 	d.reconcile(ctx, "startup")
 
+	return d.eventLoop(ctx, events, readErr)
+}
+
+// eventLoop is the daemon's main select loop. It folds inotify events
+// into reconcile, re-pushes current state on each successful OBS
+// (re)connect, and exits cleanly on ctx cancellation or inotify error.
+//
+// Extracted from run() so tests can drive it with mock channels and
+// verify the connect-driven reconciliation wiring without standing up
+// inotify / OBS / proc-scan side effects.
+func (d *daemon) eventLoop(ctx context.Context, events <-chan unix.InotifyEvent, readErr <-chan error) error {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("shutting down")
+			d.logger.InfoContext(ctx, "shutting down")
 			return nil
 		case ev := <-events:
 			d.handleEvent(ctx, ev)
+		case <-d.switcher.Connected():
+			d.pushCurrentState(ctx, "obs-connected")
 		case err := <-readErr:
 			return fmt.Errorf("inotify read: %w", err)
 		}
@@ -297,6 +310,50 @@ func (d *daemon) reconcile(ctx context.Context, trigger string) {
 	case TransitionNone:
 		d.logger.DebugContext(ctx, "rescan",
 			"trigger", trigger, "consumers", count)
+	}
+}
+
+// pushCurrentState pushes the daemon's current consumer-state view to
+// OBS without going through the tracker's 0↔N transition gate. Called
+// when the underlying OBS WebSocket (re)connects, so that activations
+// dropped while the socket was down — or never delivered because the
+// socket was stale to a now-dead OBS process — are re-fired against the
+// fresh connection.
+//
+// Idempotent at the OBS level: SetCurrentProgramScene to the same scene
+// is a no-op, and SetInputSettings rewriting device_id to the same
+// value is a no-op.
+//
+// Does NOT touch the tracker (state hasn't changed; we're just
+// re-asserting it to OBS) or the publisher (subscribers already saw
+// the correct state; only OBS was out of sync). The RPC ordering
+// matches reconcile's activate/deactivate paths so OBS-visible
+// transitions look identical regardless of whether this came from an
+// inotify event or a reconnect.
+func (d *daemon) pushCurrentState(ctx context.Context, reason string) {
+	count := d.tracker.Count()
+	if count > 0 {
+		d.logger.InfoContext(ctx, "reconcile obs to active",
+			"reason", reason, "consumers", count)
+		if err := d.switcher.SetCameraDevice(ctx, d.cameraSource, d.cameraDevice); err != nil {
+			d.logger.WarnContext(ctx, "open camera failed",
+				"source", d.cameraSource, "err", err)
+		}
+		if err := d.switcher.SetScene(ctx, d.sceneActive); err != nil {
+			d.logger.WarnContext(ctx, "set scene failed",
+				"scene", d.sceneActive, "err", err)
+		}
+		return
+	}
+	d.logger.InfoContext(ctx, "reconcile obs to idle",
+		"reason", reason, "consumers", count)
+	if err := d.switcher.SetScene(ctx, d.sceneStandby); err != nil {
+		d.logger.WarnContext(ctx, "set scene failed",
+			"scene", d.sceneStandby, "err", err)
+	}
+	if err := d.switcher.SetCameraDevice(ctx, d.cameraSource, ""); err != nil {
+		d.logger.WarnContext(ctx, "close camera failed",
+			"source", d.cameraSource, "err", err)
 	}
 }
 

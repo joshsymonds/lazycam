@@ -35,6 +35,19 @@ import (
 type Switcher interface {
 	SetScene(ctx context.Context, name string) error
 	SetCameraDevice(ctx context.Context, sourceName, deviceID string) error
+	// Connected returns a channel that emits a value each time the
+	// underlying OBS connection is (re)established. The daemon listens
+	// on this to re-fire current-state RPCs after a disconnect — the
+	// transition tracker won't re-emit Activate while the count stays
+	// at N, so without this signal a missed activation during a stale
+	// connection would never be repaired.
+	//
+	// Cap-1 buffered: multiple connects within a tick collapse to a
+	// single notification (the daemon will reconcile fresh state on
+	// receipt either way). Implementations that don't need this
+	// signal (dryRunSwitcher) return nil; selecting on a nil channel
+	// blocks forever, making the daemon's case a permanent no-op.
+	Connected() <-chan struct{}
 	Close() error
 }
 
@@ -85,6 +98,15 @@ func (d *dryRunSwitcher) SetCameraDevice(ctx context.Context, sourceName, device
 	return nil
 }
 
+// Connected returns nil for the dry-run mode: there is no real
+// connection to (re)establish, so no reconciliation signal is ever
+// emitted. The daemon's select case for connect-driven reconciliation
+// becomes a permanent no-op under dry-run, which is correct — dry-run
+// must not produce switcher side effects beyond the explicit RPC logs.
+func (d *dryRunSwitcher) Connected() <-chan struct{} {
+	return nil
+}
+
 // Close is a no-op for the dry-run mode.
 func (d *dryRunSwitcher) Close() error {
 	return nil
@@ -115,6 +137,7 @@ type liveSwitcher struct {
 	client *goobs.Client // nil while disconnected
 
 	reconnect chan struct{} // buffered, capacity 1; signalReconnect coalesces
+	connected chan struct{} // buffered, capacity 1; signalConnected coalesces
 	cancel    context.CancelFunc
 	done      chan struct{}
 
@@ -154,6 +177,7 @@ func newLiveSwitcher(parentCtx context.Context, logger *slog.Logger, opts switch
 		host:       host,
 		maxBackoff: opts.maxBackoff,
 		reconnect:  make(chan struct{}, 1),
+		connected:  make(chan struct{}, 1),
 		cancel:     cancel,
 		done:       make(chan struct{}),
 	}
@@ -339,6 +363,14 @@ func (s *liveSwitcher) connectLoop(ctx context.Context) {
 		s.logger.InfoContext(ctx, "obs connected", "host", s.host)
 		backoff = initialBackoff // reset on successful connect
 
+		// Notify the daemon so it can re-fire any state that may have
+		// gone undelivered across the connection gap. The current
+		// (re)connect is fresh, so even the first-time connection
+		// fires this — pushCurrentState is idempotent and safely
+		// reconciles whatever state already happens to be loaded in
+		// OBS, regardless of whether the prior connection succeeded.
+		s.signalConnected()
+
 		// Wait for either ctx cancellation (shutdown) or a reconnect
 		// signal raised by a failing SetScene RPC.
 		select {
@@ -388,6 +420,25 @@ func (s *liveSwitcher) markDisconnected(prev *goobs.Client) {
 func (s *liveSwitcher) signalReconnect() {
 	select {
 	case s.reconnect <- struct{}{}:
+	default:
+	}
+}
+
+// Connected returns the channel the connectLoop emits on after each
+// successful (re)connect to OBS. See the Switcher interface docstring
+// for the contract — the daemon reads from this to re-fire current
+// state across connection gaps.
+func (s *liveSwitcher) Connected() <-chan struct{} {
+	return s.connected
+}
+
+// signalConnected publishes a successful-connect event on the buffered
+// channel. Non-blocking — if a previous signal is still unread, the
+// new one is dropped (the daemon will reconcile fresh state on whatever
+// it reads, so coalescing is safe).
+func (s *liveSwitcher) signalConnected() {
+	select {
+	case s.connected <- struct{}{}:
 	default:
 	}
 }

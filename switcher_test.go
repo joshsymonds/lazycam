@@ -158,6 +158,50 @@ func TestRequireLoopback(t *testing.T) {
 	}
 }
 
+// TestDryRunSwitcher_ConnectedReturnsNil pins the contract that the
+// dry-run switcher's Connected() returns a nil channel — selecting on
+// a nil channel blocks forever, so the daemon's eventLoop case for
+// connect-driven reconciliation is a permanent no-op under dry-run.
+// This keeps dry-run testing free of OBS-side reconciliation side effects.
+func TestDryRunSwitcher_ConnectedReturnsNil(t *testing.T) {
+	t.Parallel()
+	logger, _ := captureLogger(t)
+	sw, err := newSwitcher(context.Background(), logger, switcherOptions{dryRun: true})
+	if err != nil {
+		t.Fatalf("newSwitcher: %v", err)
+	}
+	defer func() { _ = sw.Close() }()
+	if ch := sw.Connected(); ch != nil {
+		t.Errorf("dryRunSwitcher.Connected() = %v, want nil", ch)
+	}
+}
+
+// TestLiveSwitcher_ConnectedReturnsNonNilChannel confirms the live
+// switcher exposes a real channel (not nil) so the daemon's eventLoop
+// can receive on it. The emit-on-successful-connect behavior is harder
+// to unit-test without mocking the full OBS WebSocket v5 handshake;
+// the daemon-side TestDaemon_EventLoop_ConnectedTriggersPushCurrentState
+// covers the recv side via the recordingSwitcher mock.
+func TestLiveSwitcher_ConnectedReturnsNonNilChannel(t *testing.T) {
+	t.Parallel()
+	logger, _ := captureLogger(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sw, err := newSwitcher(ctx, logger, switcherOptions{
+		dryRun:     false,
+		obsURL:     "ws://127.0.0.1:1",
+		maxBackoff: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newSwitcher: %v", err)
+	}
+	defer func() { _ = sw.Close() }()
+	if sw.Connected() == nil {
+		t.Error("liveSwitcher.Connected() = nil, want non-nil channel")
+	}
+}
+
 // TestLiveSwitcher_CloseBeforeConnect locks the invariant that Close
 // is safe to call before the first connection attempt has succeeded.
 // Without this, a daemon SIGTERM during OBS startup could hang.
